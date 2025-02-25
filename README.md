@@ -53,7 +53,7 @@ This tool provides a web-based interface for developers to:
 
 ![Main view](https://github.com/kempu/lhv-api-gui/blob/main/assets/screenshots/view-1.png?raw=true)
 
-![Transactions view](https://github.com/kempu/lhv-api-gui/blob/main/assets/screenshots/view-1.png?raw=true)
+![Transactions view](https://github.com/kempu/lhv-api-gui/blob/main/assets/screenshots/view-2.png?raw=true)
 
 ---
 
