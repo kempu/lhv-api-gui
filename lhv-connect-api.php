@@ -224,17 +224,33 @@ class LHVConnectClient
         $endDate = null
     ) {
         try {
+            // Format dates properly if provided
+            $formattedStartDate = $startDate
+                ? date("Y-m-d", strtotime($startDate))
+                : null;
+            $formattedEndDate = $endDate
+                ? date("Y-m-d", strtotime($endDate))
+                : null;
+
             // Submit statement request
             $xml = $this->createAccountReportRequest(
                 $iban,
                 "camt.053.001.02",
-                $startDate,
-                $endDate
+                $formattedStartDate,
+                $formattedEndDate
             );
 
             // Log request XML for debugging
             $this->logger->debug("Account statement request XML", [
                 "xml" => $xml,
+                "originalDates" => [
+                    "startDate" => $startDate,
+                    "endDate" => $endDate,
+                ],
+                "formattedDates" => [
+                    "startDate" => $formattedStartDate,
+                    "endDate" => $formattedEndDate,
+                ],
             ]);
 
             $this->sendRequest("POST", "/account-statement", $xml, "xml");
@@ -322,12 +338,14 @@ class LHVConnectClient
                             $details = $entry->NtryDtls->TxDtls;
                         }
 
-                        // Build transaction record
+                        // Build transaction record with date in Y-m-d format
+                        $bookingDate = (string) $entry->BookgDt->Dt;
+                        $valueDate =
+                            (string) ($entry->ValDt->Dt ?? $entry->BookgDt->Dt);
+
                         $transaction = [
-                            "bookingDate" => (string) $entry->BookgDt->Dt,
-                            "valueDate" =>
-                                (string) ($entry->ValDt->Dt ??
-                                    $entry->BookgDt->Dt),
+                            "bookingDate" => $bookingDate,
+                            "valueDate" => $valueDate,
                             "amount" => $processedAmount,
                             "currency" => (string) $entry->Amt["Ccy"],
                             "type" => $this->getTransactionType($entry),
@@ -371,6 +389,41 @@ class LHVConnectClient
                 }
             }
 
+            // Filter transactions by date if startDate and endDate are provided
+            if ($startDate || $endDate) {
+                $filteredTransactions = [];
+                $startDateTimestamp = $startDate ? strtotime($startDate) : null;
+                $endDateTimestamp = $endDate
+                    ? strtotime($endDate . " 23:59:59")
+                    : null; // Include full end date
+
+                foreach ($transactions as $transaction) {
+                    $transactionDate = strtotime($transaction["bookingDate"]);
+
+                    // Apply date filters
+                    $matchesStartDate =
+                        $startDateTimestamp === null ||
+                        $transactionDate >= $startDateTimestamp;
+                    $matchesEndDate =
+                        $endDateTimestamp === null ||
+                        $transactionDate <= $endDateTimestamp;
+
+                    if ($matchesStartDate && $matchesEndDate) {
+                        $filteredTransactions[] = $transaction;
+                    }
+                }
+
+                return [
+                    "entries" => array_reverse($filteredTransactions), // Most recent first
+                    "filterApplied" => true,
+                    "dateRange" => [
+                        "start" => $startDate,
+                        "end" => $endDate,
+                    ],
+                ];
+            }
+
+            // No date filtering
             return [
                 "entries" => array_reverse($transactions), // Most recent first
             ];
@@ -918,6 +971,14 @@ class LHVConnectClient
         $startDate = null,
         $endDate = null
     ) {
+        // Log the passed dates for debugging
+        $this->logger->debug("Creating account report request", [
+            "iban" => $iban,
+            "messageType" => $messageType,
+            "startDate" => $startDate,
+            "endDate" => $endDate,
+        ]);
+
         $xml = new SimpleXMLElement(
             '<?xml version="1.0" encoding="UTF-8"?>' .
                 '<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.060.001.03"></Document>'
@@ -946,8 +1007,26 @@ class LHVConnectClient
         // Reporting Period
         $rptgPrd = $rptgReq->addChild("RptgPrd");
         $frToDt = $rptgPrd->addChild("FrToDt");
-        $frToDt->addChild("FrDt", $startDate ?: date("Y-m-d"));
-        $frToDt->addChild("ToDt", $endDate ?: date("Y-m-d"));
+
+        // Use provided dates or defaults and ensure they are properly formatted
+        $usedStartDate =
+            $startDate && preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)
+                ? $startDate
+                : date("Y-m-d", strtotime("-30 days"));
+
+        $usedEndDate =
+            $endDate && preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)
+                ? $endDate
+                : date("Y-m-d");
+
+        // Log which dates were actually used
+        $this->logger->debug("Using dates for report request", [
+            "usedStartDate" => $usedStartDate,
+            "usedEndDate" => $usedEndDate,
+        ]);
+
+        $frToDt->addChild("FrDt", $usedStartDate);
+        $frToDt->addChild("ToDt", $usedEndDate);
 
         // Time range
         $frToTm = $rptgPrd->addChild("FrToTm");
@@ -967,7 +1046,14 @@ class LHVConnectClient
             $cdOrPrtry->addChild("Prtry", "DATE");
         }
 
-        return $xml->asXML();
+        $result = $xml->asXML();
+
+        // Log the generated XML for debugging
+        $this->logger->debug("Generated account report XML", [
+            "xml" => substr($result, 0, 1000), // Show first 1000 chars of the XML to avoid too large logs
+        ]);
+
+        return $result;
     }
 
     /**

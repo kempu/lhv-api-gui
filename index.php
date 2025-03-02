@@ -146,6 +146,32 @@ class LHVTestInterface
 
         $iban = $this->accounts[$accountId]["iban"];
 
+        // Debug logging of parameters
+        $this->logger->debug("Transaction request parameters", [
+            "accountId" => $accountId,
+            "iban" => $iban,
+            "startDate" => $startDate,
+            "endDate" => $endDate,
+        ]);
+
+        // Make sure dates are properly formatted
+        if (
+            empty($startDate) ||
+            !preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)
+        ) {
+            $startDate = date("Y-m-d", strtotime("-30 days"));
+            $this->logger->info(
+                "Invalid start date format, using default: " . $startDate
+            );
+        }
+
+        if (empty($endDate) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)) {
+            $endDate = date("Y-m-d");
+            $this->logger->info(
+                "Invalid end date format, using default: " . $endDate
+            );
+        }
+
         // Use LHV API to get transactions
         $transactionsData = $this->lhvClient->getAccountTransactions(
             $iban,
@@ -156,6 +182,10 @@ class LHVTestInterface
         if (!$transactionsData) {
             throw new Exception("Failed to get transactions data");
         }
+
+        $this->logger->debug("Transaction data received", [
+            "count" => count($transactionsData["entries"] ?? []),
+        ]);
 
         return [
             "success" => true,
