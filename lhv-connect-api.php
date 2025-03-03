@@ -123,10 +123,27 @@ class LHVConnectClient
             ]);
 
             // Submit balance request
-            $this->sendRequest("POST", "/account-balance", $xml, "xml");
+            $response = $this->sendRequest(
+                "POST",
+                "/account-balance",
+                $xml,
+                "xml"
+            );
 
-            // Wait for and process response
-            $response = $this->waitForResponseMessage("ACCOUNT_BALANCE");
+            // Get the request ID to track this specific request
+            $requestId = $this->getResponseHeader("Message-Request-Id");
+            if (!$requestId) {
+                $this->logger->warning(
+                    "No request ID received for account balance"
+                );
+            }
+
+            // Wait for and process response, matching with our request ID
+            $response = $this->waitForResponseMessage(
+                "ACCOUNT_BALANCE",
+                null,
+                $requestId
+            );
 
             // Log response for debugging
             $this->logger->debug("Account balance response", [
@@ -224,51 +241,89 @@ class LHVConnectClient
         $endDate = null
     ) {
         try {
-            // Format dates properly if provided
-            $formattedStartDate = $startDate
-                ? date("Y-m-d", strtotime($startDate))
-                : null;
-            $formattedEndDate = $endDate
-                ? date("Y-m-d", strtotime($endDate))
-                : null;
+            $startTime = microtime(true);
+
+            // Log the start of the transaction request with key details
+            $this->logger->debug("TRANSACTION REQUEST STARTED", [
+                "accountId" => array_search(
+                    $iban,
+                    array_column(
+                        array_map(function ($account) {
+                            return ["iban" => $account["iban"]];
+                        }, array_values($this->config["accounts"] ?? [])),
+                        "iban"
+                    )
+                ),
+                "requestedAccount" =>
+                    "Account for IBAN " .
+                    substr($iban, 0, 4) .
+                    "..." .
+                    substr($iban, -4),
+                "startDate" => $startDate,
+                "endDate" => $endDate,
+                "available_accounts" => array_keys(
+                    $this->config["accounts"] ?? []
+                ),
+            ]);
+
+            $this->logger->debug("Using IBAN for transaction request", [
+                "accountId" => array_search(
+                    $iban,
+                    array_column(
+                        array_map(function ($account) {
+                            return ["iban" => $account["iban"]];
+                        }, array_values($this->config["accounts"] ?? [])),
+                        "iban"
+                    )
+                ),
+                "iban" => $iban,
+            ]);
 
             // Submit statement request
             $xml = $this->createAccountReportRequest(
                 $iban,
                 "camt.053.001.02",
-                $formattedStartDate,
-                $formattedEndDate
+                $startDate,
+                $endDate
             );
 
             // Log request XML for debugging
             $this->logger->debug("Account statement request XML", [
                 "xml" => $xml,
-                "originalDates" => [
-                    "startDate" => $startDate,
-                    "endDate" => $endDate,
-                ],
-                "formattedDates" => [
-                    "startDate" => $formattedStartDate,
-                    "endDate" => $formattedEndDate,
-                ],
             ]);
 
+            // Send the request and get the response with request ID
             $this->sendRequest("POST", "/account-statement", $xml, "xml");
 
-            // Wait for and process response
-            $response = $this->waitForResponseMessage("ACCOUNT_STATEMENT", 60); // Longer timeout for statements
+            // Get the request ID to track this specific request
+            $requestId = $this->getResponseHeader("Message-Request-Id");
+            if (!$requestId) {
+                $this->logger->warning(
+                    "No request ID received for account statement"
+                );
+            }
+
+            // Wait for and process response, matching with our request ID
+            $response = $this->waitForResponseMessage(
+                "ACCOUNT_STATEMENT",
+                60,
+                $requestId
+            ); // Longer timeout for statements
 
             // Log response for debugging
             $this->logger->debug("Account statement response received", [
                 "size" => strlen($response),
             ]);
 
+            // Initialize transactions array to prevent the NULL issue
+            $transactions = [];
+
             // Check if response is valid before parsing
             if (empty($response)) {
                 $this->logger->warning(
                     "Empty response received when getting account transactions"
                 );
-                return ["entries" => []];
+                return ["entries" => $transactions];
             }
 
             // Safely parse XML
@@ -284,10 +339,9 @@ class LHVConnectClient
                         "response" => substr($response, 0, 1000), // Log first 1000 chars only
                     ]
                 );
-                return ["entries" => []];
+                return ["entries" => $transactions];
             }
 
-            $transactions = [];
             $currentBalance = 0;
 
             // Get the correct namespace if present
@@ -338,14 +392,12 @@ class LHVConnectClient
                             $details = $entry->NtryDtls->TxDtls;
                         }
 
-                        // Build transaction record with date in Y-m-d format
-                        $bookingDate = (string) $entry->BookgDt->Dt;
-                        $valueDate =
-                            (string) ($entry->ValDt->Dt ?? $entry->BookgDt->Dt);
-
+                        // Build transaction record
                         $transaction = [
-                            "bookingDate" => $bookingDate,
-                            "valueDate" => $valueDate,
+                            "bookingDate" => (string) $entry->BookgDt->Dt,
+                            "valueDate" =>
+                                (string) ($entry->ValDt->DtTm ??
+                                    $entry->BookgDt->Dt),
                             "amount" => $processedAmount,
                             "currency" => (string) $entry->Amt["Ccy"],
                             "type" => $this->getTransactionType($entry),
@@ -389,43 +441,37 @@ class LHVConnectClient
                 }
             }
 
-            // Filter transactions by date if startDate and endDate are provided
-            if ($startDate || $endDate) {
-                $filteredTransactions = [];
-                $startDateTimestamp = $startDate ? strtotime($startDate) : null;
-                $endDateTimestamp = $endDate
-                    ? strtotime($endDate . " 23:59:59")
-                    : null; // Include full end date
+            // Most recent transactions first
+            $sortedTransactions = !empty($transactions)
+                ? array_reverse($transactions)
+                : [];
 
-                foreach ($transactions as $transaction) {
-                    $transactionDate = strtotime($transaction["bookingDate"]);
+            // Log completion with stats
+            $execTime = number_format(microtime(true) - $startTime, 2);
+            $this->logger->debug("API call completed", [
+                "accountId" => array_search(
+                    $iban,
+                    array_column(
+                        array_map(function ($account) {
+                            return ["iban" => $account["iban"]];
+                        }, array_values($this->config["accounts"] ?? [])),
+                        "iban"
+                    )
+                ),
+                "iban" => $iban,
+                "elapsedTime" => "$execTime seconds",
+                "transactionCount" => count($sortedTransactions),
+                "firstTransaction" => !empty($sortedTransactions)
+                    ? [
+                        "date" => $sortedTransactions[0]["bookingDate"],
+                        "amount" => $sortedTransactions[0]["amount"],
+                        "type" => $sortedTransactions[0]["type"],
+                    ]
+                    : "none",
+            ]);
 
-                    // Apply date filters
-                    $matchesStartDate =
-                        $startDateTimestamp === null ||
-                        $transactionDate >= $startDateTimestamp;
-                    $matchesEndDate =
-                        $endDateTimestamp === null ||
-                        $transactionDate <= $endDateTimestamp;
-
-                    if ($matchesStartDate && $matchesEndDate) {
-                        $filteredTransactions[] = $transaction;
-                    }
-                }
-
-                return [
-                    "entries" => array_reverse($filteredTransactions), // Most recent first
-                    "filterApplied" => true,
-                    "dateRange" => [
-                        "start" => $startDate,
-                        "end" => $endDate,
-                    ],
-                ];
-            }
-
-            // No date filtering
             return [
-                "entries" => array_reverse($transactions), // Most recent first
+                "entries" => $sortedTransactions,
             ];
         } catch (Exception $e) {
             $this->logger->error(
@@ -681,21 +727,24 @@ class LHVConnectClient
     }
 
     /**
-     * Wait for and process response message with improved error handling and logging
+     * Wait for and process response message with improved request matching
      *
      * @param string $expectedType Expected message type
      * @param int $timeout Timeout in seconds
+     * @param string $requestId Optional request ID to match with the response
      * @return string|null Response content or null if no message found
      */
     private function waitForResponseMessage(
         $expectedType = null,
-        $timeout = null
+        $timeout = null,
+        $requestId = null
     ) {
         $timeout = $timeout ?? self::MESSAGE_POLL_TIMEOUT;
         $startTime = time();
 
         $this->logger->info("Waiting for response message", [
             "expectedType" => $expectedType,
+            "requestId" => $requestId,
             "timeout" => $timeout,
         ]);
 
@@ -719,14 +768,15 @@ class LHVConnectClient
                 $messagesList = $this->getMessagesList(50);
 
                 $this->logger->debug("Messages list retrieved", [
-                    "messageCount" => count($messagesList["messages"]),
+                    "messageCount" => count($messagesList["messages"] ?? []),
                     "messages" => array_map(function ($msg) {
                         return [
                             "id" => $msg["messageResponseId"] ?? "",
                             "type" => $msg["messageResponseType"] ?? "",
+                            "requestId" => $msg["messageRequestId"] ?? "",
                             "createdTime" => $msg["messageCreatedTime"] ?? "",
                         ];
-                    }, $messagesList["messages"]),
+                    }, $messagesList["messages"] ?? []),
                 ]);
 
                 if (empty($messagesList["messages"])) {
@@ -734,21 +784,34 @@ class LHVConnectClient
                     continue;
                 }
 
-                // Find messages of the expected type
+                // Find messages of the expected type and matching requestId if provided
                 $matchingMessages = array_filter(
                     $messagesList["messages"],
-                    function ($message) use ($expectedType) {
-                        return !$expectedType ||
+                    function ($message) use ($expectedType, $requestId) {
+                        $typeMatch =
+                            !$expectedType ||
                             $message["messageResponseType"] === $expectedType;
+
+                        // If requestId is provided, also check that it matches
+                        $requestMatch =
+                            !$requestId ||
+                            ($message["messageRequestId"] ?? "") === $requestId;
+
+                        return $typeMatch && $requestMatch;
                     }
                 );
 
                 if (empty($matchingMessages)) {
                     $this->logger->debug("No matching messages found", [
                         "expectedType" => $expectedType,
+                        "requestId" => $requestId,
                         "availableTypes" => array_column(
                             $messagesList["messages"],
                             "messageResponseType"
+                        ),
+                        "availableRequestIds" => array_column(
+                            $messagesList["messages"],
+                            "messageRequestId"
                         ),
                     ]);
                     sleep(self::MESSAGE_POLL_INTERVAL);
@@ -762,6 +825,7 @@ class LHVConnectClient
                 $this->logger->info("Processing matching message", [
                     "messageId" => $messageId,
                     "type" => $message["messageResponseType"],
+                    "requestId" => $message["messageRequestId"] ?? "",
                 ]);
 
                 // Retrieve message content
@@ -791,12 +855,23 @@ class LHVConnectClient
 
         $this->logger->warning("Timeout waiting for response message", [
             "expectedType" => $expectedType,
+            "requestId" => $requestId,
             "timeout" => $timeout,
         ]);
 
         return null;
     }
 
+    /**
+     * Send API request with improved error handling and logging
+     *
+     * @param string $method HTTP method
+     * @param string $endpoint API endpoint
+     * @param string|null $data Request body
+     * @param string $contentType Content type (json|xml)
+     * @return string Response content
+     * @throws Exception On request failure
+     */
     private function sendRequest(
         $method,
         $endpoint,
@@ -876,32 +951,67 @@ class LHVConnectClient
 
         curl_setopt_array($curl, $options);
 
-        // Execute request
-        $response = curl_exec($curl);
+        // Execute request with retry logic
+        $maxRetries = 2;
+        $retryCount = 0;
+        $response = null;
 
-        // Get HTTP status code
-        $this->lastHttpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        while ($retryCount <= $maxRetries) {
+            // Execute request
+            $response = curl_exec($curl);
 
-        // Log detailed request information
-        $this->logger->debug("API Response Details", [
-            "endpoint" => $endpoint,
-            "httpCode" => $this->lastHttpCode,
-            "responseSize" => strlen($response),
-            "headers" => $this->lastResponseHeaders,
-        ]);
+            // Get HTTP status code
+            $this->lastHttpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
 
-        // Check for CURL errors
-        if (curl_errno($curl)) {
-            $error = curl_error($curl);
-            $errorNum = curl_errno($curl);
-            curl_close($curl);
-
-            $this->logger->error("cURL error", [
-                "errorNumber" => $errorNum,
-                "errorMessage" => $error,
+            // Log detailed request information
+            $this->logger->debug("API Response Details", [
+                "endpoint" => $endpoint,
+                "httpCode" => $this->lastHttpCode,
+                "responseSize" => is_string($response) ? strlen($response) : 0,
+                "headers" => $this->lastResponseHeaders,
             ]);
 
-            throw new Exception("cURL error {$errorNum}: {$error}");
+            // Check for CURL errors
+            if (curl_errno($curl)) {
+                $error = curl_error($curl);
+                $errorNum = curl_errno($curl);
+
+                $this->logger->error("cURL error", [
+                    "errorNumber" => $errorNum,
+                    "errorMessage" => $error,
+                    "retryCount" => $retryCount,
+                ]);
+
+                // Retry on connection errors
+                if (
+                    in_array($errorNum, [
+                        CURLE_COULDNT_CONNECT,
+                        CURLE_OPERATION_TIMEOUTED,
+                    ]) &&
+                    $retryCount < $maxRetries
+                ) {
+                    $retryCount++;
+                    sleep(2 * $retryCount); // Exponential backoff
+                    continue;
+                }
+
+                curl_close($curl);
+                throw new Exception("cURL error {$errorNum}: {$error}");
+            }
+
+            // Retry on 5xx server errors
+            if ($this->lastHttpCode >= 500 && $retryCount < $maxRetries) {
+                $this->logger->warning("Server error, retrying", [
+                    "httpCode" => $this->lastHttpCode,
+                    "retryCount" => $retryCount,
+                ]);
+                $retryCount++;
+                sleep(2 * $retryCount); // Exponential backoff
+                continue;
+            }
+
+            // If we reached here, we either succeeded or encountered a non-retryable error
+            break;
         }
 
         curl_close($curl);
@@ -971,14 +1081,6 @@ class LHVConnectClient
         $startDate = null,
         $endDate = null
     ) {
-        // Log the passed dates for debugging
-        $this->logger->debug("Creating account report request", [
-            "iban" => $iban,
-            "messageType" => $messageType,
-            "startDate" => $startDate,
-            "endDate" => $endDate,
-        ]);
-
         $xml = new SimpleXMLElement(
             '<?xml version="1.0" encoding="UTF-8"?>' .
                 '<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.060.001.03"></Document>'
@@ -1007,26 +1109,11 @@ class LHVConnectClient
         // Reporting Period
         $rptgPrd = $rptgReq->addChild("RptgPrd");
         $frToDt = $rptgPrd->addChild("FrToDt");
-
-        // Use provided dates or defaults and ensure they are properly formatted
-        $usedStartDate =
-            $startDate && preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)
-                ? $startDate
-                : date("Y-m-d", strtotime("-30 days"));
-
-        $usedEndDate =
-            $endDate && preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)
-                ? $endDate
-                : date("Y-m-d");
-
-        // Log which dates were actually used
-        $this->logger->debug("Using dates for report request", [
-            "usedStartDate" => $usedStartDate,
-            "usedEndDate" => $usedEndDate,
-        ]);
-
-        $frToDt->addChild("FrDt", $usedStartDate);
-        $frToDt->addChild("ToDt", $usedEndDate);
+        $frToDt->addChild(
+            "FrDt",
+            $startDate ?: date("Y-m-d", strtotime("-30 days"))
+        );
+        $frToDt->addChild("ToDt", $endDate ?: date("Y-m-d"));
 
         // Time range
         $frToTm = $rptgPrd->addChild("FrToTm");
@@ -1046,14 +1133,7 @@ class LHVConnectClient
             $cdOrPrtry->addChild("Prtry", "DATE");
         }
 
-        $result = $xml->asXML();
-
-        // Log the generated XML for debugging
-        $this->logger->debug("Generated account report XML", [
-            "xml" => substr($result, 0, 1000), // Show first 1000 chars of the XML to avoid too large logs
-        ]);
-
-        return $result;
+        return $xml->asXML();
     }
 
     /**

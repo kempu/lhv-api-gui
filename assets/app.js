@@ -249,9 +249,16 @@ function showBalanceError(element, message) {
 }
 
 function showTransactions(accountId) {
+  // Clear any existing transaction data first
+  const list = document.getElementById("transactionsList");
+  list.innerHTML =
+    '<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">Loading transactions...</td></tr>';
+
   const panel = document.getElementById("transactionsPanel");
   panel.dataset.account = accountId;
   panel.classList.remove("opacity-0", "pointer-events-none");
+
+  // Refresh transactions for the selected account
   refreshTransactions();
 }
 
@@ -265,9 +272,7 @@ async function refreshTransactions() {
   const accountId = panel.dataset.account;
   const list = document.getElementById("transactionsList");
   const spinner = panel.querySelector(".loading-spinner");
-  const refreshButton = document.querySelector(
-    'button[onclick="refreshTransactions()"]',
-  );
+  const refreshButton = panel.querySelector("button");
 
   // Show spinner
   spinner.classList.remove("hidden");
@@ -278,7 +283,8 @@ async function refreshTransactions() {
     const startDate = document.getElementById("startDate").value;
     const endDate = document.getElementById("endDate").value;
 
-    console.log(`Fetching transactions with dates: ${startDate} to ${endDate}`);
+    // Add a timestamp to prevent caching
+    const timestamp = new Date().getTime();
 
     const data = await fetchWithLock(
       window.location.href,
@@ -286,12 +292,14 @@ async function refreshTransactions() {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
+          "Cache-Control": "no-cache",
         },
         body: new URLSearchParams({
           action: "getTransactions",
           account: accountId,
           startDate: startDate,
           endDate: endDate,
+          _: timestamp, // Cache busting
         }),
       },
       refreshButton,
@@ -301,20 +309,25 @@ async function refreshTransactions() {
       throw new Error(data.error || "Failed to load transactions");
     }
 
-    console.log(
-      `Received ${data.transactions ? data.transactions.length : 0} transactions`,
-    );
-
-    // Directly update the DOM with transaction data
     updateTransactionsList(list, data.transactions);
   } catch (error) {
     console.error("Error:", error);
+    list.innerHTML =
+      '<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-red-500">' +
+      "Error loading transactions: " +
+      (error.message || "Unknown error") +
+      "</td></tr>";
     showAlert(error.message || "Failed to load transactions", "error");
   } finally {
     // Hide spinner
     spinner.classList.add("hidden");
     panel.classList.remove("opacity-50");
   }
+}
+
+// Function to make the onclick handler in HTML work
+function refreshTransactionsPanel() {
+  refreshTransactions();
 }
 
 function updateTransactionsList(element, transactions) {
@@ -342,7 +355,10 @@ function createTransactionRow(tx) {
   row.className = "hover:bg-gray-50";
 
   const cells = [
-    { text: formatDate(tx.bookingDate), class: "text-gray-900" },
+    {
+      text: formatDate(tx.valueDate || tx.bookingDate),
+      class: "text-gray-900",
+    },
     { text: tx.type, class: "text-gray-500" },
     { text: tx.description || "", class: "text-gray-900" },
     { text: tx.reference || "", class: "text-gray-500" },

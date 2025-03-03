@@ -140,19 +140,26 @@ class LHVTestInterface
 
     private function getAccountTransactions($accountId, $startDate, $endDate)
     {
+        // Enhanced debug logging to trace exactly what's happening
+        $this->logger->debug("TRANSACTION REQUEST STARTED", [
+            "accountId" => $accountId,
+            "requestedAccount" => isset($this->accounts[$accountId])
+                ? $this->accounts[$accountId]["name"]
+                : "INVALID ACCOUNT",
+            "startDate" => $startDate,
+            "endDate" => $endDate,
+            "available_accounts" => array_keys($this->accounts),
+        ]);
+
         if (!isset($this->accounts[$accountId])) {
-            throw new Exception("Invalid account ID");
+            $this->logger->error("Invalid account ID requested", [
+                "requestedId" => $accountId,
+                "availableIds" => array_keys($this->accounts),
+            ]);
+            throw new Exception("Invalid account ID: " . $accountId);
         }
 
         $iban = $this->accounts[$accountId]["iban"];
-
-        // Debug logging of parameters
-        $this->logger->debug("Transaction request parameters", [
-            "accountId" => $accountId,
-            "iban" => $iban,
-            "startDate" => $startDate,
-            "endDate" => $endDate,
-        ]);
 
         // Make sure dates are properly formatted
         if (
@@ -172,25 +179,70 @@ class LHVTestInterface
             );
         }
 
-        // Use LHV API to get transactions
-        $transactionsData = $this->lhvClient->getAccountTransactions(
-            $iban,
-            $startDate,
-            $endDate
-        );
-
-        if (!$transactionsData) {
-            throw new Exception("Failed to get transactions data");
-        }
-
-        $this->logger->debug("Transaction data received", [
-            "count" => count($transactionsData["entries"] ?? []),
+        // Log the IBAN being used for the API call
+        $this->logger->debug("Using IBAN for transaction request", [
+            "accountId" => $accountId,
+            "iban" => $iban,
         ]);
 
-        return [
-            "success" => true,
-            "transactions" => $transactionsData["entries"] ?? [],
-        ];
+        try {
+            // Use LHV API to get transactions with optimistic timeout
+            $startTime = microtime(true);
+            $transactionsData = $this->lhvClient->getAccountTransactions(
+                $iban,
+                $startDate,
+                $endDate
+            );
+            $endTime = microtime(true);
+
+            $this->logger->debug("API call completed", [
+                "accountId" => $accountId,
+                "iban" => $iban,
+                "elapsedTime" => round($endTime - $startTime, 2) . " seconds",
+                "transactionCount" => count($transactionsData["entries"] ?? []),
+                "firstTransaction" => !empty($transactionsData["entries"])
+                    ? [
+                        "date" =>
+                            $transactionsData["entries"][0]["bookingDate"] ??
+                            "N/A",
+                        "amount" =>
+                            $transactionsData["entries"][0]["amount"] ?? "N/A",
+                        "type" =>
+                            $transactionsData["entries"][0]["type"] ?? "N/A",
+                    ]
+                    : "No transactions",
+            ]);
+
+            if (!$transactionsData) {
+                $this->logger->warning(
+                    "No transaction data returned from API",
+                    [
+                        "accountId" => $accountId,
+                        "iban" => $iban,
+                    ]
+                );
+                throw new Exception("Failed to get transactions data");
+            }
+
+            return [
+                "success" => true,
+                "transactions" => $transactionsData["entries"] ?? [],
+                "account" => [
+                    "id" => $accountId,
+                    "iban" => $iban,
+                    "name" => $this->accounts[$accountId]["name"],
+                ],
+            ];
+        } catch (Exception $e) {
+            $this->logger->error("Error in transaction request", [
+                "accountId" => $accountId,
+                "iban" => $iban,
+                "error" => $e->getMessage(),
+                "trace" => $e->getTraceAsString(),
+            ]);
+
+            throw $e;
+        }
     }
 
     private function makeTransfer(
@@ -449,7 +501,7 @@ class LHVTestInterface
                                value="<?php echo date("Y-m-d"); ?>">
                     </div>
                     <div class="flex items-end">
-                        <button onclick="refreshTransactions()" class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700">
+                        <button onclick="refreshTransactionsPanel()" class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700">
                             Refresh
                         </button>
                     </div>
@@ -458,7 +510,7 @@ class LHVTestInterface
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Transaction Date</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Reference</th>
